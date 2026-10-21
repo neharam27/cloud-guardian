@@ -2,4 +2,4 @@ boto3>=1.35
 moto[ec2,sns,sqs,dynamodb]>=5.0
 pytest>=8.0
 ruff>=0.6
-checkov>=3.2
+checkov>=3.3.29
