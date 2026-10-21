@@ -2,7 +2,7 @@
 
 A serverless AWS cost-governance tool. Every day it scans an account for forgotten, wasteful resources, estimates what each one costs per month, and emails a ranked report.
 
-**Status: early build.** Three read-only scanners (unattached EBS volumes, unassociated Elastic IPs, old snapshots). Nothing is ever modified or deleted.
+**Status: early build.** Four read-only scanners (unattached EBS volumes, unassociated Elastic IPs, old snapshots, long-stopped EC2 instances). Nothing is ever modified or deleted.
 
 ## How it works
 
@@ -24,6 +24,7 @@ SNS topic (encrypted) --> email: only what changed, plus a weekly digest
 | `ebs-unattached-volume` | EBS volumes attached to nothing | `ec2:DescribeVolumes` |
 | `eip-unassociated` | Elastic IPs allocated but not in use | `ec2:DescribeAddresses` |
 | `ebs-old-snapshot` | Your own snapshots older than `snapshot_min_age_days` (default 90) that no AMI uses and no lifecycle service manages | `ec2:DescribeSnapshots`, `DescribeImages`, `DescribeVolumes` |
+| `ec2-long-stopped-instance` | Instances stopped for at least `stopped_min_age_days` (default 14). Compute is free while stopped, but the attached disks keep billing | `ec2:DescribeInstances`, `DescribeVolumes` |
 
 ## Change-only reporting
 
@@ -57,6 +58,7 @@ Estimates are approximate list prices (`src/scanners/pricing.py`) and are **not*
 - EBS: storage only, from us-east-1 prices times a rough regional multiplier. Provisioned IOPS, throughput and snapshot costs are ignored, so this under-estimates.
 - Elastic IP: the public IPv4 hourly charge times 730 hours.
 - Snapshots: full source-volume size at the standard-tier price, with no regional adjustment. Snapshots are incremental, so real cost is usually lower.
+- Stopped instances: the attached EBS volumes only, priced like the EBS estimate above. Snapshots, AMIs and Elastic IPs tied to the instance are not counted.
 
 Treat them as a ranking signal, not billing data.
 
@@ -65,6 +67,7 @@ Treat them as a ranking signal, not billing data.
 - `MIN_AGE_DAYS` filters on volume *creation* age, because `DescribeVolumes` does not report when a volume was detached. A precise "unattached for N days" needs CloudTrail.
 - `DescribeAddresses` reports no allocation time, so Elastic IPs have no age filter: a brand-new address you are about to attach is reported until it is associated. Tag it `guardian:ignore=true` if that matters.
 
+- "Stopped for N days" comes from the timestamp inside the instance's `StateTransitionReason` text (`DescribeInstances` has no stop-time field). Some stops carry no timestamp, for example a shutdown from inside the operating system. For those the stop time is unknown: an instance launched less than `stopped_min_age_days` ago is skipped, and an older one is reported but marked "stop time unknown" instead of guessing. CloudTrail would give an exact answer and is a later improvement.
 - Snapshots are skipped when an AMI you own references them, or when they carry a `dlm:managed` or `aws:backup*` tag. Deleting one snapshot in a chain may free little space, because later snapshots can depend on its blocks.
 
 ## Quick start
@@ -136,7 +139,8 @@ All services used here (Lambda, SNS, EventBridge Scheduler, S3, DynamoDB on-dema
 - [x] Unattached EBS scanner, Terraform, tests, CI
 - [x] Unassociated Elastic IP scanner, multi-scanner handler with failure isolation
 - [x] Old-snapshot scanner with AMI-in-use and lifecycle-managed exclusions
-- [ ] More scanners: long-stopped EC2, idle RDS, untagged resources
+- [x] Long-stopped EC2 instances scanner
+- [ ] More scanners: idle RDS, untagged resources
 - [x] Findings history in DynamoDB, change-only emails, weekly digest
 - [ ] Simple dashboard
 - [ ] Approval-gated remediation (Step Functions): expiring approvals, idempotency, revalidation before acting, dry-run by default
@@ -154,6 +158,7 @@ src/scanners/common.py             Finding type and shared helpers (ignore tag, 
 src/scanners/ebs_unattached.py     Unattached EBS volumes
 src/scanners/eip_unassociated.py   Unassociated Elastic IPs
 src/scanners/snapshots_old.py      Old, unused snapshots
+src/scanners/ec2_stopped.py        Long-stopped EC2 instances and the disks they still bill for
 src/scanners/pricing.py            Cost estimation (approximate)
 tests/                             pytest + moto (mocked AWS, no account needed)
 terraform/                         Main stack

@@ -90,6 +90,7 @@ data "aws_iam_policy_document" "scanner" {
       "ec2:DescribeAddresses",
       "ec2:DescribeSnapshots",
       "ec2:DescribeImages",
+      "ec2:DescribeInstances",
     ]
     resources = ["*"]
   }
@@ -142,7 +143,7 @@ resource "aws_lambda_function" "scanner" {
   # checkov:skip=CKV_AWS_173:Environment variables hold no secrets (an SNS topic ARN and a number).
   # checkov:skip=CKV_AWS_272:Code signing is out of scope for this project.
   function_name = "${local.name}-scanner"
-  description   = "Read-only scan for wasted EBS volumes, Elastic IPs and snapshots; tracks findings in DynamoDB and emails what changed."
+  description   = "Read-only scan for wasted EBS volumes, Elastic IPs, snapshots and long-stopped instances; tracks findings in DynamoDB and emails what changed."
 
   role             = aws_iam_role.scanner.arn
   runtime          = "python3.13"
@@ -159,6 +160,7 @@ resource "aws_lambda_function" "scanner" {
       SNS_TOPIC_ARN         = aws_sns_topic.reports.arn
       MIN_AGE_DAYS          = tostring(var.min_age_days)
       SNAPSHOT_MIN_AGE_DAYS = tostring(var.snapshot_min_age_days)
+      STOPPED_MIN_AGE_DAYS  = tostring(var.stopped_min_age_days)
       FINDINGS_TABLE        = aws_dynamodb_table.findings.name
       DIGEST_WEEKDAY        = tostring(var.digest_weekday)
     }

@@ -16,7 +16,7 @@ from typing import Any
 import boto3
 
 from findings_store import FindingStore, ScanDiff, finding_key
-from scanners import ebs_unattached, eip_unassociated, snapshots_old
+from scanners import ebs_unattached, ec2_stopped, eip_unassociated, snapshots_old
 from scanners.common import Finding
 
 logger = logging.getLogger()
@@ -32,7 +32,11 @@ def error_label(exc: Exception) -> str:
 
 
 def run_scanners(
-    ec2: Any, region: str, min_age_days: int, snapshot_min_age_days: int = 90
+    ec2: Any,
+    region: str,
+    min_age_days: int,
+    snapshot_min_age_days: int = 90,
+    stopped_min_age_days: int = 14,
 ) -> tuple[list[Finding], list[str], set[str]]:
     """Run every scanner. One failing scanner must not hide the others' results.
 
@@ -45,6 +49,9 @@ def run_scanners(
         eip_unassociated.CHECK_NAME: lambda: eip_unassociated.scan(ec2, region=region),
         snapshots_old.CHECK_NAME: lambda: snapshots_old.scan(
             ec2, region=region, min_age_days=snapshot_min_age_days
+        ),
+        ec2_stopped.CHECK_NAME: lambda: ec2_stopped.scan(
+            ec2, region=region, min_age_days=stopped_min_age_days
         ),
     }
 
@@ -148,6 +155,7 @@ def lambda_handler(event: dict[str, Any] | None, context: Any) -> dict[str, Any]
     region = os.environ.get("AWS_REGION", "ap-south-1")
     min_age_days = int(os.environ.get("MIN_AGE_DAYS", "3"))
     snapshot_min_age_days = int(os.environ.get("SNAPSHOT_MIN_AGE_DAYS", "90"))
+    stopped_min_age_days = int(os.environ.get("STOPPED_MIN_AGE_DAYS", "14"))
     topic_arn = os.environ.get("SNS_TOPIC_ARN")
     table_name = os.environ.get("FINDINGS_TABLE")
     digest_weekday = int(os.environ.get("DIGEST_WEEKDAY", "0"))  # 0 = Monday, UTC
@@ -156,7 +164,9 @@ def lambda_handler(event: dict[str, Any] | None, context: Any) -> dict[str, Any]
     digest = bool((event or {}).get("digest")) or now.weekday() == digest_weekday
 
     ec2 = boto3.client("ec2", region_name=region)
-    findings, errors, succeeded = run_scanners(ec2, region, min_age_days, snapshot_min_age_days)
+    findings, errors, succeeded = run_scanners(
+        ec2, region, min_age_days, snapshot_min_age_days, stopped_min_age_days
+    )
 
     for finding in findings:
         logger.info(json.dumps(finding.to_dict(), default=str))

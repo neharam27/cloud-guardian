@@ -48,6 +48,17 @@ variable "snapshot_min_age_days" {
   }
 }
 
+variable "stopped_min_age_days" {
+  description = "Only report EC2 instances that have been stopped at least this many days."
+  type        = number
+  default     = 14
+
+  validation {
+    condition     = var.stopped_min_age_days >= 0
+    error_message = "stopped_min_age_days must be 0 or greater."
+  }
+}
+
 variable "digest_weekday" {
   description = "Day of the week (UTC) on which the full digest of still-open findings is emailed. 0 = Monday ... 6 = Sunday."
   type        = number
