@@ -12,7 +12,7 @@ from typing import Any
 
 import boto3
 
-from scanners import ebs_unattached, eip_unassociated
+from scanners import ebs_unattached, eip_unassociated, snapshots_old
 from scanners.common import Finding
 
 logger = logging.getLogger()
@@ -27,13 +27,18 @@ def error_label(exc: Exception) -> str:
     return code or type(exc).__name__
 
 
-def run_scanners(ec2: Any, region: str, min_age_days: int) -> tuple[list[Finding], list[str]]:
+def run_scanners(
+    ec2: Any, region: str, min_age_days: int, snapshot_min_age_days: int = 90
+) -> tuple[list[Finding], list[str]]:
     """Run every scanner. One failing scanner must not hide the others' results."""
     scanners = {
         ebs_unattached.CHECK_NAME: lambda: ebs_unattached.scan(
             ec2, region=region, min_age_days=min_age_days
         ),
         eip_unassociated.CHECK_NAME: lambda: eip_unassociated.scan(ec2, region=region),
+        snapshots_old.CHECK_NAME: lambda: snapshots_old.scan(
+            ec2, region=region, min_age_days=snapshot_min_age_days
+        ),
     }
 
     findings: list[Finding] = []
@@ -88,10 +93,11 @@ def format_report(
 def lambda_handler(event: dict[str, Any] | None, context: Any) -> dict[str, Any]:
     region = os.environ.get("AWS_REGION", "ap-south-1")
     min_age_days = int(os.environ.get("MIN_AGE_DAYS", "3"))
+    snapshot_min_age_days = int(os.environ.get("SNAPSHOT_MIN_AGE_DAYS", "90"))
     topic_arn = os.environ.get("SNS_TOPIC_ARN")
 
     ec2 = boto3.client("ec2", region_name=region)
-    findings, errors = run_scanners(ec2, region, min_age_days)
+    findings, errors = run_scanners(ec2, region, min_age_days, snapshot_min_age_days)
 
     for finding in findings:
         logger.info(json.dumps(finding.to_dict(), default=str))

@@ -32,6 +32,11 @@ REGION_MULTIPLIER: dict[str, float] = {
     "ap-southeast-2": 1.20,
 }
 
+# Snapshot storage, standard tier, us-east-1 list price per GB-month. Regional
+# differences are ignored on purpose: billed size is incremental and usually smaller
+# than the volume size, so this number is a rough ranking signal either way.
+SNAPSHOT_PRICE_PER_GIB_MONTH = 0.05
+
 # Public IPv4 addresses are billed per hour, whether or not they are in use.
 # Approximate list price; check the AWS pricing page before quoting it.
 PUBLIC_IPV4_PRICE_PER_HOUR = 0.005
@@ -46,6 +51,11 @@ def estimate_ebs_monthly_cost(volume_type: str, size_gib: int, region: str) -> f
     base = BASE_PRICE_PER_GIB_MONTH.get(volume_type, FALLBACK_PRICE_PER_GIB_MONTH)
     multiplier = REGION_MULTIPLIER.get(region, 1.0)
     return round(base * multiplier * size_gib, 2)
+
+
+def estimate_snapshot_monthly_cost(size_gib: int) -> float:
+    """Approximate monthly cost of a snapshot of a volume this size, in USD."""
+    return round(SNAPSHOT_PRICE_PER_GIB_MONTH * size_gib, 2)
 
 
 def estimate_public_ipv4_monthly_cost() -> float:

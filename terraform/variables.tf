@@ -37,6 +37,17 @@ variable "min_age_days" {
   }
 }
 
+variable "snapshot_min_age_days" {
+  description = "Only report snapshots at least this many days old."
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = var.snapshot_min_age_days >= 0
+    error_message = "snapshot_min_age_days must be 0 or greater."
+  }
+}
+
 variable "log_retention_days" {
   description = "CloudWatch Logs retention for the scanner Lambda."
   type        = number

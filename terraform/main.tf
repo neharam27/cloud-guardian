@@ -53,10 +53,15 @@ data "aws_iam_policy_document" "scanner" {
   }
 
   # Describe* calls do not support resource-level permissions, so "*" is required.
-  # These are the ONLY EC2 permissions the scanner has, and both are read-only.
+  # These are the ONLY EC2 permissions the scanner has, and all are read-only.
   statement {
-    sid       = "ReadEc2Inventory"
-    actions   = ["ec2:DescribeVolumes", "ec2:DescribeAddresses"]
+    sid = "ReadEc2Inventory"
+    actions = [
+      "ec2:DescribeVolumes",
+      "ec2:DescribeAddresses",
+      "ec2:DescribeSnapshots",
+      "ec2:DescribeImages",
+    ]
     resources = ["*"]
   }
 
@@ -92,7 +97,7 @@ resource "aws_lambda_function" "scanner" {
   # checkov:skip=CKV_AWS_173:Environment variables hold no secrets (an SNS topic ARN and a number).
   # checkov:skip=CKV_AWS_272:Code signing is out of scope for this project.
   function_name = "${local.name}-scanner"
-  description   = "Read-only scan for unattached EBS volumes and Elastic IPs; emails a cost-ranked report."
+  description   = "Read-only scan for unattached EBS volumes, Elastic IPs and old snapshots; emails a cost-ranked report."
 
   role             = aws_iam_role.scanner.arn
   runtime          = "python3.13"
@@ -106,8 +111,9 @@ resource "aws_lambda_function" "scanner" {
 
   environment {
     variables = {
-      SNS_TOPIC_ARN = aws_sns_topic.reports.arn
-      MIN_AGE_DAYS  = tostring(var.min_age_days)
+      SNS_TOPIC_ARN         = aws_sns_topic.reports.arn
+      MIN_AGE_DAYS          = tostring(var.min_age_days)
+      SNAPSHOT_MIN_AGE_DAYS = tostring(var.snapshot_min_age_days)
     }
   }
 
