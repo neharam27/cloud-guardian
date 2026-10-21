@@ -2,32 +2,14 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import boto3
-import pytest
-from moto import mock_aws
 
 import handler
 from scanners import ebs_unattached
+from scanners.common import Finding
 from scanners.pricing import estimate_ebs_monthly_cost
 
 REGION = "ap-south-1"
 AZ = "ap-south-1a"
-
-
-@pytest.fixture(autouse=True)
-def aws_env(monkeypatch):
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", REGION)
-    monkeypatch.setenv("AWS_REGION", REGION)
-    monkeypatch.delenv("SNS_TOPIC_ARN", raising=False)
-    monkeypatch.delenv("MIN_AGE_DAYS", raising=False)
-
-
-@pytest.fixture
-def ec2():
-    with mock_aws():
-        yield boto3.client("ec2", region_name=REGION)
 
 
 def make_volume(ec2, size=10, volume_type="gp3", tags=None):
@@ -48,6 +30,7 @@ def make_volume(ec2, size=10, volume_type="gp3", tags=None):
 def test_cost_estimate_scales_with_size_and_region():
     assert estimate_ebs_monthly_cost("gp3", 100, "us-east-1") == 8.0
     assert estimate_ebs_monthly_cost("gp3", 100, "ap-south-1") == round(8.0 * 1.14, 2)
+    assert estimate_ebs_monthly_cost("gp3", 100, "ap-southeast-2") == round(8.0 * 1.20, 2)
 
 
 def test_unknown_volume_type_uses_fallback_not_zero():
@@ -158,7 +141,12 @@ def test_handler_sends_nothing_when_no_findings(ec2, monkeypatch):
 
     result = handler.lambda_handler({}, None)
 
-    assert result == {"findings": 0, "estimated_monthly_waste_usd": 0, "notified": False}
+    assert result == {
+        "findings": 0,
+        "estimated_monthly_waste_usd": 0,
+        "notified": False,
+        "errors": [],
+    }
 
 
 def test_handler_without_topic_does_not_crash(ec2, monkeypatch):
@@ -173,7 +161,7 @@ def test_handler_without_topic_does_not_crash(ec2, monkeypatch):
 
 def test_report_truncates_long_lists():
     findings = [
-        ebs_unattached.Finding(
+        Finding(
             check="ebs-unattached-volume",
             resource_id=f"vol-{i:05d}",
             resource_type="AWS::EC2::Volume",
@@ -181,7 +169,7 @@ def test_report_truncates_long_lists():
             estimated_monthly_cost_usd=1.0,
             severity="low",
             recommendation="",
-            evidence={"size_gib": 10, "volume_type": "gp3", "age_days": 5},
+            summary="10 GiB gp3 volume, unattached",
         )
         for i in range(handler.MAX_ITEMS_IN_REPORT + 7)
     ]

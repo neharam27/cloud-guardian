@@ -30,7 +30,7 @@ resource "aws_sns_topic_subscription" "email" {
 resource "aws_cloudwatch_log_group" "scanner" {
   # checkov:skip=CKV_AWS_158:Default CloudWatch encryption is enough for scan logs here; a customer-managed key adds cost and complexity.
   # checkov:skip=CKV_AWS_338:These are operational scan logs, not audit logs. 30 days (configurable) keeps storage near zero.
-  name              = "/aws/lambda/${local.name}-ebs-scanner"
+  name              = "/aws/lambda/${local.name}-scanner"
   retention_in_days = var.log_retention_days
 }
 
@@ -53,10 +53,10 @@ data "aws_iam_policy_document" "scanner" {
   }
 
   # Describe* calls do not support resource-level permissions, so "*" is required.
-  # This is the ONLY EC2 permission the scanner has, and it is read-only.
+  # These are the ONLY EC2 permissions the scanner has, and both are read-only.
   statement {
-    sid       = "ReadVolumes"
-    actions   = ["ec2:DescribeVolumes"]
+    sid       = "ReadEc2Inventory"
+    actions   = ["ec2:DescribeVolumes", "ec2:DescribeAddresses"]
     resources = ["*"]
   }
 
@@ -75,7 +75,7 @@ data "aws_iam_policy_document" "scanner" {
 }
 
 resource "aws_iam_role" "scanner" {
-  name               = "${local.name}-ebs-scanner"
+  name               = "${local.name}-scanner"
   assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
 }
 
@@ -85,14 +85,14 @@ resource "aws_iam_role_policy" "scanner" {
   policy = data.aws_iam_policy_document.scanner.json
 }
 
-resource "aws_lambda_function" "ebs_scanner" {
+resource "aws_lambda_function" "scanner" {
   # checkov:skip=CKV_AWS_117:Function needs no VPC access; it only calls public AWS APIs. A VPC would require a NAT gateway or endpoints, which cost money.
   # checkov:skip=CKV_AWS_116:No dead-letter queue yet; failures are visible in CloudWatch Logs and the scheduler retries. Revisit in week 3.
   # checkov:skip=CKV_AWS_115:Reserved concurrency can fail on new accounts with low concurrency limits. One invocation per day, so concurrency is not a risk.
   # checkov:skip=CKV_AWS_173:Environment variables hold no secrets (an SNS topic ARN and a number).
   # checkov:skip=CKV_AWS_272:Code signing is out of scope for this project.
-  function_name = "${local.name}-ebs-scanner"
-  description   = "Read-only scan for unattached EBS volumes; emails a cost-ranked report."
+  function_name = "${local.name}-scanner"
+  description   = "Read-only scan for unattached EBS volumes and Elastic IPs; emails a cost-ranked report."
 
   role             = aws_iam_role.scanner.arn
   runtime          = "python3.13"
@@ -137,7 +137,7 @@ data "aws_iam_policy_document" "scheduler_assume" {
 data "aws_iam_policy_document" "scheduler_invoke" {
   statement {
     actions   = ["lambda:InvokeFunction"]
-    resources = [aws_lambda_function.ebs_scanner.arn]
+    resources = [aws_lambda_function.scanner.arn]
   }
 }
 
@@ -147,15 +147,15 @@ resource "aws_iam_role" "scheduler" {
 }
 
 resource "aws_iam_role_policy" "scheduler" {
-  name   = "invoke-ebs-scanner"
+  name   = "invoke-scanner"
   role   = aws_iam_role.scheduler.id
   policy = data.aws_iam_policy_document.scheduler_invoke.json
 }
 
 resource "aws_scheduler_schedule" "daily_scan" {
   # checkov:skip=CKV_AWS_297:The schedule payload is a constant with no sensitive data; a customer-managed KMS key adds cost for no benefit.
-  name        = "${local.name}-ebs-daily"
-  description = "Runs the EBS scanner once a day."
+  name        = "${local.name}-daily"
+  description = "Runs the scanner once a day."
 
   schedule_expression          = var.schedule_expression
   schedule_expression_timezone = var.schedule_timezone
@@ -165,7 +165,7 @@ resource "aws_scheduler_schedule" "daily_scan" {
   }
 
   target {
-    arn      = aws_lambda_function.ebs_scanner.arn
+    arn      = aws_lambda_function.scanner.arn
     role_arn = aws_iam_role.scheduler.arn
     input    = jsonencode({ source = "scheduler" })
 

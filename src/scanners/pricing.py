@@ -29,7 +29,13 @@ BASE_PRICE_PER_GIB_MONTH: dict[str, float] = {
 REGION_MULTIPLIER: dict[str, float] = {
     "us-east-1": 1.0,
     "ap-south-1": 1.14,
+    "ap-southeast-2": 1.20,
 }
+
+# Public IPv4 addresses are billed per hour, whether or not they are in use.
+# Approximate list price; check the AWS pricing page before quoting it.
+PUBLIC_IPV4_PRICE_PER_HOUR = 0.005
+HOURS_PER_MONTH = 730
 
 # Used when a volume type is not in the table above.
 FALLBACK_PRICE_PER_GIB_MONTH = 0.10
@@ -40,3 +46,8 @@ def estimate_ebs_monthly_cost(volume_type: str, size_gib: int, region: str) -> f
     base = BASE_PRICE_PER_GIB_MONTH.get(volume_type, FALLBACK_PRICE_PER_GIB_MONTH)
     multiplier = REGION_MULTIPLIER.get(region, 1.0)
     return round(base * multiplier * size_gib, 2)
+
+
+def estimate_public_ipv4_monthly_cost() -> float:
+    """Approximate monthly cost of one public IPv4 address, in USD."""
+    return round(PUBLIC_IPV4_PRICE_PER_HOUR * HOURS_PER_MONTH, 2)
