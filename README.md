@@ -11,10 +11,13 @@ EventBridge Scheduler (daily)
         |
         v
 Lambda: scanner --ec2:Describe* (read-only)--> EC2
-        |
+        |  \
+        |   +--> DynamoDB: findings history (open / resolved, first and last seen)
         v
-SNS topic (encrypted) --> email report
+SNS topic (encrypted) --> email: only what changed, plus a weekly digest
 ```
+
+## What it checks
 
 | Check | What it finds | API used |
 |---|---|---|
@@ -22,7 +25,26 @@ SNS topic (encrypted) --> email report
 | `eip-unassociated` | Elastic IPs allocated but not in use | `ec2:DescribeAddresses` |
 | `ebs-old-snapshot` | Your own snapshots older than `snapshot_min_age_days` (default 90) that no AMI uses and no lifecycle service manages | `ec2:DescribeSnapshots`, `DescribeImages`, `DescribeVolumes` |
 
-- **Least privilege:** the scanner's role can call those read-only EC2 APIs, publish to one SNS topic, and write its own logs. Nothing else.
+## Change-only reporting
+
+Emailing the same list every morning trains people to ignore the email. Findings are stored in DynamoDB, and the daily email covers only what changed:
+
+- **New** findings since the last report
+- **Resolved** findings (they stopped appearing)
+- a one-line count of everything still open
+
+Once a week (Monday UTC by default, `digest_weekday`) the email lists every open finding. Invoke the Lambda with `{"digest": true}` to get a digest on demand.
+
+Two rules keep the history trustworthy:
+
+- **A finding is only marked announced after the email was actually sent.** If publishing fails, the next run announces it again, so nothing is lost silently.
+- **A scanner that crashed never resolves anything.** "I could not look" is not "it is gone", so that scanner's open findings stay open until it succeeds again.
+
+If the history table itself fails, the scan falls back to emailing every finding and says so in the report. A broken history must never hide waste.
+
+## Design
+
+- **Least privilege:** the scanner's role can call those read-only EC2 APIs, publish to one SNS topic, read and write one DynamoDB table (no delete, no scan), and write its own logs. Nothing else.
 - **Opt-out:** tag any resource `guardian:ignore=true` and it is never reported.
 - **Evidence on every finding:** the facts a human needs to judge it, plus the cost basis.
 - **Failure isolation:** if one scanner errors, the others still run and the email says which one failed (without leaking the error text).
@@ -96,9 +118,18 @@ aws ec2 allocate-address --domain vpc --region YOUR_REGION
 
 Delete both afterwards (`aws ec2 delete-volume ...`, `aws ec2 release-address --allocation-id ...`). To remove the whole stack: `terraform destroy` in `terraform/`.
 
+## Looking at the history
+
+```bash
+aws dynamodb scan --table-name cloud-guardian-findings --region YOUR_REGION \
+  --query "Items[].[status.S,check.S,resource_id.S,first_seen.S,last_seen.S]" --output table
+```
+
+The table is not backed up on purpose: it is derived from AWS state, so losing it only restarts the first-seen history. (Your own IAM user can scan it; the Lambda's role cannot.)
+
 ## Staying inside free credits
 
-All services used here (Lambda, SNS, EventBridge Scheduler, S3, CloudWatch Logs) are effectively free at this scale. Avoid NAT gateways, load balancers and RDS instances in anything you add. Set a Budget alert before deploying.
+All services used here (Lambda, SNS, EventBridge Scheduler, S3, DynamoDB on-demand, CloudWatch Logs) are effectively free at this scale. Avoid NAT gateways, load balancers and RDS instances in anything you add. Set a Budget alert before deploying.
 
 ## Roadmap
 
@@ -106,7 +137,8 @@ All services used here (Lambda, SNS, EventBridge Scheduler, S3, CloudWatch Logs)
 - [x] Unassociated Elastic IP scanner, multi-scanner handler with failure isolation
 - [x] Old-snapshot scanner with AMI-in-use and lifecycle-managed exclusions
 - [ ] More scanners: long-stopped EC2, idle RDS, untagged resources
-- [ ] Findings history in DynamoDB, daily digest, simple dashboard
+- [x] Findings history in DynamoDB, change-only emails, weekly digest
+- [ ] Simple dashboard
 - [ ] Approval-gated remediation (Step Functions): expiring approvals, idempotency, revalidation before acting, dry-run by default
 - [ ] Safety test suite: refuses on `guardian:ignore`, expired approval, changed state, duplicate action, out-of-scope resource
 - [ ] GitHub Actions deploy via OIDC (no stored keys)
@@ -117,6 +149,7 @@ All services used here (Lambda, SNS, EventBridge Scheduler, S3, CloudWatch Logs)
 
 ```
 src/handler.py                     Lambda entry point, scanner orchestration, report formatting
+src/findings_store.py              Findings history (DynamoDB): new / still open / resolved
 src/scanners/common.py             Finding type and shared helpers (ignore tag, severity)
 src/scanners/ebs_unattached.py     Unattached EBS volumes
 src/scanners/eip_unassociated.py   Unassociated Elastic IPs

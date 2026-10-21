@@ -1,7 +1,5 @@
-import json
-
-import boto3
 import pytest
+from helpers import make_topic_with_queue, read_email
 
 import handler
 from scanners import ebs_unattached, eip_unassociated
@@ -88,23 +86,6 @@ def test_no_addresses_means_no_findings(ec2):
 
 
 # --- handler: multiple scanners ----------------------------------------------
-
-
-def make_topic_with_queue():
-    sns = boto3.client("sns", region_name=REGION)
-    sqs = boto3.client("sqs", region_name=REGION)
-    topic_arn = sns.create_topic(Name="guardian-test")["TopicArn"]
-    queue_url = sqs.create_queue(QueueName="guardian-test-q")["QueueUrl"]
-    queue_arn = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["QueueArn"])[
-        "Attributes"
-    ]["QueueArn"]
-    sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=queue_arn)
-    return topic_arn, sqs, queue_url
-
-
-def read_email(sqs, queue_url):
-    message = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)["Messages"][0]
-    return json.loads(message["Body"])
 
 
 def test_handler_reports_findings_from_both_scanners(ec2, monkeypatch):

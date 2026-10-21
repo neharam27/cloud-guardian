@@ -146,6 +146,8 @@ def test_handler_sends_nothing_when_no_findings(ec2, monkeypatch):
         "estimated_monthly_waste_usd": 0,
         "notified": False,
         "errors": [],
+        "new": 0,
+        "resolved": 0,
     }
 
 

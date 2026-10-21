@@ -22,3 +22,27 @@ def aws_env(monkeypatch):
 def ec2():
     with mock_aws():
         yield boto3.client("ec2", region_name=REGION)
+
+
+@pytest.fixture
+def findings_table(ec2):
+    """A fake findings table with the same schema Terraform creates.
+
+    Depends on `ec2` only so that it runs inside the same moto mock.
+    """
+    return boto3.resource("dynamodb", region_name=REGION).create_table(
+        TableName="guardian-findings",
+        KeySchema=[{"AttributeName": "finding_id", "KeyType": "HASH"}],
+        AttributeDefinitions=[
+            {"AttributeName": "finding_id", "AttributeType": "S"},
+            {"AttributeName": "status", "AttributeType": "S"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "by-status",
+                "KeySchema": [{"AttributeName": "status", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )

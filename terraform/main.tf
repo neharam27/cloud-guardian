@@ -24,6 +24,35 @@ resource "aws_sns_topic_subscription" "email" {
   endpoint  = var.alert_email
 }
 
+# --- Findings history ----------------------------------------------------------
+
+# One item per finding (see src/findings_store.py). On-demand billing means no
+# capacity to manage and no cost while idle.
+resource "aws_dynamodb_table" "findings" {
+  # checkov:skip=CKV_AWS_28:Point-in-time recovery is skipped on purpose. The data is derived from AWS state and rebuilt by the next scan; losing the table only restarts first_seen history.
+  # checkov:skip=CKV_AWS_119:Encrypted at rest with the default AWS-owned key. A customer-managed KMS key adds cost and key-policy complexity for non-sensitive scan metadata.
+  name         = "${local.name}-findings"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "finding_id"
+
+  attribute {
+    name = "finding_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "status"
+    type = "S"
+  }
+
+  # Lets the scanner list every open finding without scanning the whole table.
+  global_secondary_index {
+    name            = "by-status"
+    hash_key        = "status"
+    projection_type = "ALL"
+  }
+}
+
 # --- Scanner Lambda ------------------------------------------------------------
 
 # Created explicitly so retention is bounded (otherwise logs are kept forever).
@@ -71,6 +100,22 @@ data "aws_iam_policy_document" "scanner" {
     resources = [aws_sns_topic.reports.arn]
   }
 
+  # Findings history: the one table and its status index, nothing else. No Delete,
+  # no Scan, no table-level actions.
+  statement {
+    sid = "FindingsHistory"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:Query",
+    ]
+    resources = [
+      aws_dynamodb_table.findings.arn,
+      "${aws_dynamodb_table.findings.arn}/index/by-status",
+    ]
+  }
+
   # Required because tracing is enabled on the function. These actions cannot be scoped.
   statement {
     sid       = "XRayTracing"
@@ -97,7 +142,7 @@ resource "aws_lambda_function" "scanner" {
   # checkov:skip=CKV_AWS_173:Environment variables hold no secrets (an SNS topic ARN and a number).
   # checkov:skip=CKV_AWS_272:Code signing is out of scope for this project.
   function_name = "${local.name}-scanner"
-  description   = "Read-only scan for unattached EBS volumes, Elastic IPs and old snapshots; emails a cost-ranked report."
+  description   = "Read-only scan for wasted EBS volumes, Elastic IPs and snapshots; tracks findings in DynamoDB and emails what changed."
 
   role             = aws_iam_role.scanner.arn
   runtime          = "python3.13"
@@ -114,6 +159,8 @@ resource "aws_lambda_function" "scanner" {
       SNS_TOPIC_ARN         = aws_sns_topic.reports.arn
       MIN_AGE_DAYS          = tostring(var.min_age_days)
       SNAPSHOT_MIN_AGE_DAYS = tostring(var.snapshot_min_age_days)
+      FINDINGS_TABLE        = aws_dynamodb_table.findings.name
+      DIGEST_WEEKDAY        = tostring(var.digest_weekday)
     }
   }
 

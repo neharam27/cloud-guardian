@@ -48,6 +48,17 @@ variable "snapshot_min_age_days" {
   }
 }
 
+variable "digest_weekday" {
+  description = "Day of the week (UTC) on which the full digest of still-open findings is emailed. 0 = Monday ... 6 = Sunday."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.digest_weekday >= 0 && var.digest_weekday <= 6
+    error_message = "digest_weekday must be between 0 (Monday) and 6 (Sunday)."
+  }
+}
+
 variable "log_retention_days" {
   description = "CloudWatch Logs retention for the scanner Lambda."
   type        = number

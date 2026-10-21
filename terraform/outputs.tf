@@ -3,6 +3,11 @@ output "lambda_function_name" {
   value       = aws_lambda_function.scanner.function_name
 }
 
+output "findings_table_name" {
+  description = "DynamoDB table holding findings history."
+  value       = aws_dynamodb_table.findings.name
+}
+
 output "sns_topic_arn" {
   description = "Topic that receives scan reports."
   value       = aws_sns_topic.reports.arn
