@@ -51,6 +51,22 @@ If the history table itself fails, the scan falls back to emailing every finding
 - **Failure isolation:** if one scanner errors, the others still run and the email says which one failed (without leaking the error text).
 - **Infrastructure as code:** everything is Terraform; state lives in S3 with native locking (no DynamoDB table).
 
+## Approval-gated clean-up (core built, not deployed yet)
+
+Scanning is read-only. Acting is a separate, much stricter path, and the first action is deleting one unattached EBS volume. The code is in `src/remediation/` and is covered by tests; it is **not yet connected to the emails or deployed**, so today nothing in AWS can trigger it.
+
+The rules, each one backed by a test that fails if the rule is removed:
+
+- **A human approves every action.** An approval is a random one-time token. Only its SHA-256 hash is stored, so the table never holds a usable link. It expires after 24 hours and can be used exactly once, even if two people click at the same moment.
+- **Dry run is the default** and changes nothing. A dry run does not use the approval up.
+- **The target is checked at the moment of action,** with the very same function the scanner uses (`evaluate_volume`). Attached since the report? Tagged `guardian:ignore` since? Too new? Then it refuses. Already gone? Nothing to do, and that is not an error.
+- **Back up first.** A snapshot is taken and must be `completed`, and must be a snapshot of this exact volume, before the volume is touched. If the backup fails or stalls, nothing is deleted.
+- **Strict scope.** Only a well-formed `vol-…` id in this region, from the `ebs-unattached-volume` check. Anything else is refused.
+- **Only one delete call, with the validated id.** If AWS errors midway, the result says so without leaking error text, and the approval stays used so a human has to ask again. "Never twice" matters more than "retry for me".
+- **Everything is recorded** against the approval (outcome and detail) as an audit trail.
+
+Still to build: approval links in the email (the link opens a confirmation page and only a button press acts, because email scanners pre-fetch links), a separate write-capable role limited to this one action with an IAM deny on `guardian:ignore` as a second safety layer, and a Step Functions workflow that runs the steps with waits and retries.
+
 ## Cost estimates: read this
 
 Estimates are approximate list prices (`src/scanners/pricing.py`) and are **not** checked against the live AWS price list.
@@ -143,8 +159,10 @@ All services used here (Lambda, SNS, EventBridge Scheduler, S3, DynamoDB on-dema
 - [ ] More scanners: idle RDS, untagged resources
 - [x] Findings history in DynamoDB, change-only emails, weekly digest
 - [ ] Simple dashboard
-- [ ] Approval-gated remediation (Step Functions): expiring approvals, idempotency, revalidation before acting, dry-run by default
-- [ ] Safety test suite: refuses on `guardian:ignore`, expired approval, changed state, duplicate action, out-of-scope resource
+- [x] Approval-gated clean-up core for unattached EBS volumes: one-time expiring approvals, re-check before acting, backup before delete, dry-run by default
+- [x] Safety test suite for that core: refuses on `guardian:ignore`, expired or used approval, changed state, duplicate action, out-of-scope resource (each guard verified by breaking it on purpose)
+- [ ] Connect it: approval links in the email, narrowly scoped write role, Step Functions workflow
+- [ ] Try it end to end on a real test volume
 - [ ] GitHub Actions deploy via OIDC (no stored keys)
 - [ ] Reproducible evaluation on seeded waste scenarios (precision, recall, scan time)
 - [ ] Optional: AI-written explanations of findings (never makes decisions)
@@ -154,6 +172,9 @@ All services used here (Lambda, SNS, EventBridge Scheduler, S3, DynamoDB on-dema
 ```
 src/handler.py                     Lambda entry point, scanner orchestration, report formatting
 src/findings_store.py              Findings history (DynamoDB): new / still open / resolved
+src/remediation/approvals.py       One-time, expiring approval tokens (DynamoDB, hashed)
+src/remediation/ebs_delete.py      Back up then delete one unattached volume, with guards
+src/remediation/executor.py        Approval to action, plus an audit record
 src/scanners/common.py             Finding type and shared helpers (ignore tag, severity)
 src/scanners/ebs_unattached.py     Unattached EBS volumes
 src/scanners/eip_unassociated.py   Unassociated Elastic IPs

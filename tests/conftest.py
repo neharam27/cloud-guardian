@@ -25,6 +25,17 @@ def ec2():
 
 
 @pytest.fixture
+def approvals_table(ec2):
+    """A fake approvals table with the schema Terraform will create for it."""
+    return boto3.resource("dynamodb", region_name=REGION).create_table(
+        TableName="guardian-approvals",
+        KeySchema=[{"AttributeName": "approval_id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "approval_id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+
+@pytest.fixture
 def findings_table(ec2):
     """A fake findings table with the same schema Terraform creates.
 
