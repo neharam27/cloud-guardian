@@ -87,7 +87,8 @@ Things to know:
 
 - Anyone who has the email can use its links for 24 hours. Do not forward it.
 - The approver URL is public by necessity (a browser has no AWS credentials). The unguessable token is the only credential. Guessing one is not realistic (256 random bits), and a wrong guess only costs one cheap database read.
-- Status: dry run is the intended first deployment. It has been tested against a fake AWS only. Live mode has not yet been run on a real volume.
+- Status: tried end to end on real AWS (Sydney) with one throwaway 1 GiB volume. In dry run, the confirmation page and the button changed nothing and did not use the link up. After switching to live, one approval took a backup snapshot (about 47 seconds, completed, tagged with the volume and approval ids), deleted the volume, and the next scan closed the finding as resolved. Then it was switched back to dry run, which removed the write permission again.
+- Not yet exercised on real AWS: the IAM Deny for volumes tagged `guardian:ignore` (the code-level `guardian:ignore` check is tested, the IAM layer behind it is not), a backup that fails or stalls, and volumes that are encrypted or larger than a toy size. The tests for those run against a fake AWS only.
 
 ## Cost estimates: read this
 
@@ -183,7 +184,8 @@ All services used here (Lambda, SNS, EventBridge Scheduler, S3, DynamoDB on-dema
 - [x] Approval-gated clean-up core for unattached EBS volumes: one-time expiring approvals, re-check before acting, backup before delete, dry-run by default
 - [x] Safety test suite for that core: refuses on `guardian:ignore`, expired or used approval, changed state, duplicate action, out-of-scope resource (each guard verified by breaking it on purpose)
 - [x] Connected: one-time links in the email, public confirmation page, separate executor, dry run by default
-- [ ] Try it end to end on a real test volume (dry run first, then live)
+- [x] Tried end to end on a real test volume (dry run first, then live)
+- [ ] Exercise the remaining live paths on real AWS (IAM Deny on `guardian:ignore`, encrypted volume)
 - [ ] Optional: run the executor steps as a Step Functions workflow for a visual run history
 - [ ] GitHub Actions deploy via OIDC (no stored keys)
 - [ ] Reproducible evaluation on seeded waste scenarios (precision, recall, scan time)
