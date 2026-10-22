@@ -117,6 +117,14 @@ data "aws_iam_policy_document" "scanner" {
     ]
   }
 
+  # The scanner may CREATE approval links for the emails it sends. It cannot read, claim
+  # or change them, so it can never approve or act on anything itself.
+  statement {
+    sid       = "CreateApprovals"
+    actions   = ["dynamodb:PutItem"]
+    resources = [aws_dynamodb_table.approvals.arn]
+  }
+
   # Required because tracing is enabled on the function. These actions cannot be scoped.
   statement {
     sid       = "XRayTracing"
@@ -163,6 +171,8 @@ resource "aws_lambda_function" "scanner" {
       STOPPED_MIN_AGE_DAYS  = tostring(var.stopped_min_age_days)
       FINDINGS_TABLE        = aws_dynamodb_table.findings.name
       DIGEST_WEEKDAY        = tostring(var.digest_weekday)
+      APPROVALS_TABLE       = aws_dynamodb_table.approvals.name
+      APPROVER_URL          = aws_lambda_function_url.approver.function_url
     }
   }
 

@@ -27,6 +27,7 @@ from botocore.exceptions import ClientError
 
 STATUS_PENDING = "pending"
 STATUS_CLAIMED = "claimed"
+OUTCOME_RUNNING = "running"
 
 DEFAULT_TTL_SECONDS = 24 * 60 * 60
 # Keep spent approvals a while after expiry so a late click can be told "expired"
@@ -137,6 +138,39 @@ class ApprovalStore:
             self.peek(token, now)  # raises the specific reason
             raise UnknownApproval from exc  # pragma: no cover - lost a race we cannot name
         return self._approval(response["Attributes"])
+
+    def get(self, approval_id: str) -> dict[str, Any] | None:
+        """Load an approval by its hash (what the executor is handed), or None."""
+        if not approval_id or len(approval_id) > _MAX_TOKEN_LENGTH:
+            return None
+        return self.table.get_item(Key={"approval_id": approval_id}, ConsistentRead=True).get(
+            "Item"
+        )
+
+    def begin(self, approval_id: str, now: datetime | None = None) -> bool:
+        """Mark a claimed approval as running. Succeeds at most once.
+
+        This is the run-once guard for the executor: even if the same message were
+        delivered twice (a retry, a duplicate), only one delivery gets True.
+        """
+        now = now or datetime.now(UTC)
+        try:
+            self.table.update_item(
+                Key={"approval_id": approval_id},
+                UpdateExpression="SET outcome = :running, started_at = :now",
+                ConditionExpression="#s = :claimed AND attribute_not_exists(outcome)",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":running": OUTCOME_RUNNING,
+                    ":claimed": STATUS_CLAIMED,
+                    ":now": now.isoformat(),
+                },
+            )
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return False
+            raise
+        return True
 
     def finish(
         self, approval: Approval, outcome: str, detail: str, now: datetime | None = None

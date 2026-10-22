@@ -1,8 +1,9 @@
 """Lambda entry point: run the scanners, track findings over time, email what changed.
 
 Read-only with respect to your infrastructure: nothing here modifies or deletes any
-AWS resource. The only thing it writes is its own findings history (DynamoDB) and
-the notification (SNS).
+AWS resource. The only things it writes are its own findings history (DynamoDB), one-time
+approval links for the clean-up flow (DynamoDB), and the notification (SNS). Acting on a
+link is done by other functions, which this one cannot call.
 """
 
 from __future__ import annotations
@@ -10,12 +11,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
 import boto3
 
 from findings_store import FindingStore, ScanDiff, finding_key
+from remediation import ebs_delete
+from remediation.approvals import ApprovalStore
 from scanners import ebs_unattached, ec2_stopped, eip_unassociated, snapshots_old
 from scanners.common import Finding
 
@@ -70,13 +74,41 @@ def run_scanners(
     return findings, errors, succeeded
 
 
-def _finding_lines(title: str, findings: list[Finding]) -> list[str]:
+LinkFor = Callable[[Finding], str | None]
+
+
+def make_link_factory(store: ApprovalStore, base_url: str, now: datetime) -> LinkFor:
+    """Build the function that makes a one-time clean-up link for a finding.
+
+    Only unattached volumes have a clean-up action. A failure to create a link is logged
+    and simply leaves the link out: it must never break a scan or hide a finding.
+    """
+
+    def link_for(finding: Finding) -> str | None:
+        if finding.check != ebs_unattached.CHECK_NAME:
+            return None
+        try:
+            token = store.create(finding_key(finding), ebs_delete.ACTION, now)
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not create an approval link for %s", finding.resource_id)
+            return None
+        return f"{base_url.rstrip('/')}/?t={token}"
+
+    return link_for
+
+
+def _finding_lines(
+    title: str, findings: list[Finding], link_for: LinkFor | None = None
+) -> list[str]:
     lines = [title]
     for f in findings[:MAX_ITEMS_IN_REPORT]:
         lines.append(
             f"- [{f.severity.upper()}] {f.check} {f.resource_id}: {f.summary}, "
             f"~${f.estimated_monthly_cost_usd}/month"
         )
+        url = link_for(f) if link_for else None
+        if url:
+            lines.append(f"    Clean up (confirm page; nothing happens until you press): {url}")
     hidden = len(findings) - MAX_ITEMS_IN_REPORT
     if hidden > 0:
         lines.append(f"...and {hidden} more (see CloudWatch Logs).")
@@ -94,6 +126,7 @@ def format_report(
     *,
     diff: ScanDiff | None = None,
     digest: bool = False,
+    link_for: LinkFor | None = None,
 ) -> tuple[str, str]:
     """Build (subject, body) for the notification.
 
@@ -103,6 +136,15 @@ def format_report(
     """
     errors = errors or []
     total = _cost(findings)
+
+    links_issued = 0
+
+    def tracked_link(finding: Finding) -> str | None:
+        nonlocal links_issued
+        url = link_for(finding) if link_for else None
+        if url:
+            links_issued += 1
+        return url
 
     if diff is None:
         subject = f"[Cloud Guardian] {len(findings)} finding(s), ~${total}/month ({region})"
@@ -126,14 +168,14 @@ def format_report(
     ]
     if new:
         title = "Findings:" if diff is None else "New since the last report:"
-        lines += _finding_lines(title, new)
+        lines += _finding_lines(title, new, tracked_link)
     if resolved:
         lines.append("Resolved since the last scan:")
         lines += [f"- {r['check']} {r['resource_id']}: {r['summary']}" for r in resolved]
         lines.append("")
     if still_open:
         if digest:
-            lines += _finding_lines("Still open (weekly digest):", still_open)
+            lines += _finding_lines("Still open (weekly digest):", still_open, tracked_link)
         else:
             lines += [
                 f"Still open, already reported: {len(still_open)} finding(s), "
@@ -144,6 +186,12 @@ def format_report(
         lines += ["Scanner errors (details are in CloudWatch Logs):"]
         lines += [f"- {e}" for e in errors] + [""]
 
+    if links_issued:
+        lines += [
+            "Clean-up links work once and expire in 24 hours. Anyone who has this email "
+            "can use them, so do not forward it.",
+            "",
+        ]
     lines += [
         "Nothing in your infrastructure was changed. Scans are read-only.",
         "To exclude a resource, add the tag guardian:ignore=true.",
@@ -159,6 +207,8 @@ def lambda_handler(event: dict[str, Any] | None, context: Any) -> dict[str, Any]
     topic_arn = os.environ.get("SNS_TOPIC_ARN")
     table_name = os.environ.get("FINDINGS_TABLE")
     digest_weekday = int(os.environ.get("DIGEST_WEEKDAY", "0"))  # 0 = Monday, UTC
+    approvals_table = os.environ.get("APPROVALS_TABLE")
+    approver_url = os.environ.get("APPROVER_URL")
 
     now = datetime.now(UTC)
     digest = bool((event or {}).get("digest")) or now.weekday() == digest_weekday
@@ -190,7 +240,15 @@ def lambda_handler(event: dict[str, Any] | None, context: Any) -> dict[str, Any]
     notified = False
     if should_notify:
         if topic_arn:
-            subject, body = format_report(findings, region, errors, diff=diff, digest=digest)
+            link_for = None
+            if approvals_table and approver_url:
+                approvals = ApprovalStore(
+                    boto3.resource("dynamodb", region_name=region).Table(approvals_table)
+                )
+                link_for = make_link_factory(approvals, approver_url, now)
+            subject, body = format_report(
+                findings, region, errors, diff=diff, digest=digest, link_for=link_for
+            )
             boto3.client("sns", region_name=region).publish(
                 TopicArn=topic_arn, Subject=subject, Message=body
             )

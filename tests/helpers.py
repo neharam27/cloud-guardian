@@ -3,8 +3,12 @@
 import json
 
 import boto3
+from botocore.exceptions import ClientError
+
+from scanners import ebs_unattached
 
 REGION = "ap-south-1"
+AZ = "ap-south-1a"
 
 
 def make_topic_with_queue():
@@ -30,3 +34,42 @@ def read_email(sqs, queue_url):
     emails = read_emails(sqs, queue_url)
     assert emails, "expected an email but none arrived"
     return emails[0]
+
+
+# --- EBS volumes and Cloud Guardian backups (shared by the clean-up tests) ---------
+
+
+def make_volume(ec2, size=10, tags=None):
+    kwargs = {"AvailabilityZone": AZ, "Size": size, "VolumeType": "gp3"}
+    if tags:
+        kwargs["TagSpecifications"] = [
+            {
+                "ResourceType": "volume",
+                "Tags": [{"Key": k, "Value": v} for k, v in tags.items()],
+            }
+        ]
+    return ec2.create_volume(**kwargs)["VolumeId"]
+
+
+def finding_id(volume_id, region=REGION, check=ebs_unattached.CHECK_NAME):
+    return f"{check}#{region}#{volume_id}"
+
+
+def volume_exists(ec2, volume_id):
+    try:
+        ec2.describe_volumes(VolumeIds=[volume_id])
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "InvalidVolume.NotFound":
+            return False
+        raise
+    return True
+
+
+def backups(ec2):
+    """Snapshots created by Cloud Guardian (identified by our tag)."""
+    found = []
+    for snap in ec2.describe_snapshots(OwnerIds=["self"])["Snapshots"]:
+        tags = {t["Key"]: t["Value"] for t in snap.get("Tags", [])}
+        if "guardian:backup-of" in tags:
+            found.append((snap, tags))
+    return found

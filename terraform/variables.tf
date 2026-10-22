@@ -59,6 +59,17 @@ variable "stopped_min_age_days" {
   }
 }
 
+variable "cleanup_mode" {
+  description = "dry_run: approval links only show what WOULD happen, and the executor has no permission to change anything. live: the links really back up and delete volumes."
+  type        = string
+  default     = "dry_run"
+
+  validation {
+    condition     = contains(["dry_run", "live"], var.cleanup_mode)
+    error_message = "cleanup_mode must be \"dry_run\" or \"live\"."
+  }
+}
+
 variable "digest_weekday" {
   description = "Day of the week (UTC) on which the full digest of still-open findings is emailed. 0 = Monday ... 6 = Sunday."
   type        = number

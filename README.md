@@ -17,6 +17,8 @@ Lambda: scanner --ec2:Describe* (read-only)--> EC2
 SNS topic (encrypted) --> email: only what changed, plus a weekly digest
 ```
 
+Unattached-volume findings in the email also carry a one-time clean-up link; see Approval-gated clean-up below.
+
 ## What it checks
 
 | Check | What it finds | API used |
@@ -45,27 +47,47 @@ If the history table itself fails, the scan falls back to emailing every finding
 
 ## Design
 
-- **Least privilege:** the scanner's role can call those read-only EC2 APIs, publish to one SNS topic, read and write one DynamoDB table (no delete, no scan), and write its own logs. Nothing else.
+- **Least privilege:** the scanner's role can call those read-only EC2 APIs, publish to one SNS topic, read and write one DynamoDB table (no delete, no scan), create (only create) approval links in a second table, and write its own logs. Nothing else.
 - **Opt-out:** tag any resource `guardian:ignore=true` and it is never reported.
 - **Evidence on every finding:** the facts a human needs to judge it, plus the cost basis.
 - **Failure isolation:** if one scanner errors, the others still run and the email says which one failed (without leaking the error text).
 - **Infrastructure as code:** everything is Terraform; state lives in S3 with native locking (no DynamoDB table).
 
-## Approval-gated clean-up (core built, not deployed yet)
+## Approval-gated clean-up
 
-Scanning is read-only. Acting is a separate, much stricter path, and the first action is deleting one unattached EBS volume. The code is in `src/remediation/` and is covered by tests; it is **not yet connected to the emails or deployed**, so today nothing in AWS can trigger it.
+Scanning is read-only. Acting is a separate, much stricter path, and the only action so far is deleting one unattached EBS volume, after backing it up.
 
-The rules, each one backed by a test that fails if the rule is removed:
+```
+scanner email --(one-time link)--> approver: public page, a button, NO EC2 permissions
+                                        |  press the button
+                                        v
+                    executor: re-checks, backs up, deletes. The only function with EC2 write
+                    permissions, and only when cleanup_mode = live. It emails the outcome.
+```
 
-- **A human approves every action.** An approval is a random one-time token. Only its SHA-256 hash is stored, so the table never holds a usable link. It expires after 24 hours and can be used exactly once, even if two people click at the same moment.
-- **Dry run is the default** and changes nothing. A dry run does not use the approval up.
+1. The scanner adds a one-time link under each unattached-volume finding it lists.
+2. **Opening the link only shows a confirmation page.** Email security tools pre-fetch links to scan them, so a link that acted on open could delete your volume. Only the button (a POST, with the token in the body, never the URL) acts.
+3. Pressing it uses the approval up (once only) and starts the executor. The executor trusts nothing in that message but an id: it re-reads the approval from the database.
+4. It checks the volume again at that moment, takes a backup snapshot, checks the backup, checks the volume once more, and only then deletes.
+
+**One switch, two layers.** `cleanup_mode` in `terraform.tfvars` defaults to `dry_run`. In dry run the button only shows what would happen (and does not use the approval up), and the executor's IAM role has no permission to snapshot or delete, so even a bug in the code could not change anything. `live` turns on both. Only the exact word `false` in the executor's `DRY_RUN` setting enables real actions, and nothing in a message can override it.
+
+The rules, each backed by a test that fails if the rule is removed (every guard was verified by breaking it on purpose):
+
+- **A human approves every action.** The link carries a random one-time token. Only its SHA-256 hash is stored. It expires after 24 hours and can be used exactly once, even if two people click at the same moment.
+- **Dry run is the default** and changes nothing.
 - **The target is checked at the moment of action,** with the very same function the scanner uses (`evaluate_volume`). Attached since the report? Tagged `guardian:ignore` since? Too new? Then it refuses. Already gone? Nothing to do, and that is not an error.
-- **Back up first.** A snapshot is taken and must be `completed`, and must be a snapshot of this exact volume, before the volume is touched. If the backup fails or stalls, nothing is deleted.
-- **Strict scope.** Only a well-formed `vol-…` id in this region, from the `ebs-unattached-volume` check. Anything else is refused.
-- **Only one delete call, with the validated id.** If AWS errors midway, the result says so without leaking error text, and the approval stays used so a human has to ask again. "Never twice" matters more than "retry for me".
-- **Everything is recorded** against the approval (outcome and detail) as an audit trail.
+- **Back up first.** The snapshot must be `completed` and must be a snapshot of this exact volume. If the backup fails or stalls, nothing is deleted.
+- **Strict scope.** Only a well-formed `vol-...` id in this region from the `ebs-unattached-volume` check.
+- **Runs at most once.** The approval flips to "running" in one conditional write, and automatic retries of the executor are turned off, so a duplicate delivery cannot delete twice. If something fails midway the approval stays used and a human asks again: "never twice" matters more than "retry for me".
+- **A second safety layer in IAM.** In live mode the role has an explicit Deny on snapshotting or deleting any volume tagged `guardian:ignore` (any value). AWS also refuses to delete an attached volume.
+- **Everything is recorded** against the approval (outcome and detail) and the outcome is emailed.
 
-Still to build: approval links in the email (the link opens a confirmation page and only a button press acts, because email scanners pre-fetch links), a separate write-capable role limited to this one action with an IAM deny on `guardian:ignore` as a second safety layer, and a Step Functions workflow that runs the steps with waits and retries.
+Things to know:
+
+- Anyone who has the email can use its links for 24 hours. Do not forward it.
+- The approver URL is public by necessity (a browser has no AWS credentials). The unguessable token is the only credential. Guessing one is not realistic (256 random bits), and a wrong guess only costs one cheap database read.
+- Status: dry run is the intended first deployment. It has been tested against a fake AWS only. Live mode has not yet been run on a real volume.
 
 ## Cost estimates: read this
 
@@ -82,7 +104,6 @@ Treat them as a ranking signal, not billing data.
 
 - `MIN_AGE_DAYS` filters on volume *creation* age, because `DescribeVolumes` does not report when a volume was detached. A precise "unattached for N days" needs CloudTrail.
 - `DescribeAddresses` reports no allocation time, so Elastic IPs have no age filter: a brand-new address you are about to attach is reported until it is associated. Tag it `guardian:ignore=true` if that matters.
-
 - "Stopped for N days" comes from the timestamp inside the instance's `StateTransitionReason` text (`DescribeInstances` has no stop-time field). Some stops carry no timestamp, for example a shutdown from inside the operating system. For those the stop time is unknown: an instance launched less than `stopped_min_age_days` ago is skipped, and an older one is reported but marked "stop time unknown" instead of guessing. CloudTrail would give an exact answer and is a later improvement.
 - Snapshots are skipped when an AMI you own references them, or when they carry a `dlm:managed` or `aws:backup*` tag. Deleting one snapshot in a chain may free little space, because later snapshots can depend on its blocks.
 
@@ -161,8 +182,9 @@ All services used here (Lambda, SNS, EventBridge Scheduler, S3, DynamoDB on-dema
 - [ ] Simple dashboard
 - [x] Approval-gated clean-up core for unattached EBS volumes: one-time expiring approvals, re-check before acting, backup before delete, dry-run by default
 - [x] Safety test suite for that core: refuses on `guardian:ignore`, expired or used approval, changed state, duplicate action, out-of-scope resource (each guard verified by breaking it on purpose)
-- [ ] Connect it: approval links in the email, narrowly scoped write role, Step Functions workflow
-- [ ] Try it end to end on a real test volume
+- [x] Connected: one-time links in the email, public confirmation page, separate executor, dry run by default
+- [ ] Try it end to end on a real test volume (dry run first, then live)
+- [ ] Optional: run the executor steps as a Step Functions workflow for a visual run history
 - [ ] GitHub Actions deploy via OIDC (no stored keys)
 - [ ] Reproducible evaluation on seeded waste scenarios (precision, recall, scan time)
 - [ ] Optional: AI-written explanations of findings (never makes decisions)
@@ -172,6 +194,8 @@ All services used here (Lambda, SNS, EventBridge Scheduler, S3, DynamoDB on-dema
 ```
 src/handler.py                     Lambda entry point, scanner orchestration, report formatting
 src/findings_store.py              Findings history (DynamoDB): new / still open / resolved
+src/approver.py                    Public confirmation page for clean-up links (no EC2 permissions)
+src/cleanup_executor.py            Carries out one approved clean-up (the only function that can act)
 src/remediation/approvals.py       One-time, expiring approval tokens (DynamoDB, hashed)
 src/remediation/ebs_delete.py      Back up then delete one unattached volume, with guards
 src/remediation/executor.py        Approval to action, plus an audit record
@@ -182,7 +206,7 @@ src/scanners/snapshots_old.py      Old, unused snapshots
 src/scanners/ec2_stopped.py        Long-stopped EC2 instances and the disks they still bill for
 src/scanners/pricing.py            Cost estimation (approximate)
 tests/                             pytest + moto (mocked AWS, no account needed)
-terraform/                         Main stack
+terraform/                         Main stack (cleanup.tf holds the clean-up pieces)
 terraform/bootstrap/               One-time state bucket
 .github/workflows/ci.yml           Lint, test, terraform validate, Checkov, gitleaks
 ```
