@@ -132,6 +132,7 @@ Treat them as a ranking signal, not billing data.
 - `DescribeAddresses` reports no allocation time, so Elastic IPs have no age filter: a brand-new address you are about to attach is reported until it is associated. Tag it `guardian:ignore=true` if that matters.
 - Detection looks at state and age only, never at actual use (CPU, network, disk activity). AWS Compute Optimizer does look at usage; see the comparison above.
 - One region per deployment. Scan several regions by deploying once per region.
+- Deployment is manual (`terraform apply` from a laptop). The GitHub Actions deploy exists but cannot run on the author's account; see Deploying from GitHub Actions.
 - "Stopped for N days" comes from the timestamp inside the instance's `StateTransitionReason` text (`DescribeInstances` has no stop-time field). Some stops carry no timestamp, for example a shutdown from inside the operating system. For those the stop time is unknown: an instance launched less than `stopped_min_age_days` ago is skipped, and an older one is reported but marked "stop time unknown" instead of guessing. CloudTrail would give an exact answer and is a later improvement.
 - Snapshots are skipped when an AMI you own references them, or when they carry a `dlm:managed` or `aws:backup*` tag. Deleting one snapshot in a chain may free little space, because later snapshots can depend on its blocks.
 
@@ -190,7 +191,7 @@ Delete both afterwards (`aws ec2 delete-volume ...`, `aws ec2 release-address --
 
 You can keep running `terraform apply` by hand. This adds a pipeline that plans every change and applies it only after you approve, with **no AWS keys stored on GitHub**.
 
-Status: written, linted and tested piece by piece (the scripts, the plan summary, the destroy guard). It has not run against real GitHub and AWS yet; see the Roadmap.
+Status: **blocked on the author's account, so it has never run.** The workflow and scripts are written, linted and tested piece by piece (the log hiding, the plan summary, the destroy guard). But when the first AWS resource was created, AWS answered with an explicit deny from a service control policy of the organization the account belongs to. Creating an OIDC provider is forbidden there, and so is even listing them. Only the organization's administrators can lift that, so deployments are still done from a laptop with `terraform apply`. The AWS side is switched off by default (`enable_github_oidc = false`), so nothing in `terraform/bootstrap` tries to create it. If your account allows OIDC providers, the setup below applies.
 
 ```mermaid
 flowchart LR
@@ -224,10 +225,12 @@ flowchart LR
 
    ```
    cd terraform/bootstrap
-   terraform plan      # expect additions only, nothing about the state bucket
-   terraform apply
+   terraform plan  -var="enable_github_oidc=true"    # expect additions only, nothing about the state bucket
+   terraform apply -var="enable_github_oidc=true"
    terraform output
    ```
+
+   Add `-var="region=..."` to both if your region is not the default.
 
    If the plan mentions the state bucket, stop: the `region` variable differs from the one you used the first time.
 
@@ -266,7 +269,7 @@ All services used here (Lambda, SNS, EventBridge Scheduler, S3, DynamoDB on-dema
 - [ ] Exercise the remaining live paths on real AWS (IAM Deny on `guardian:ignore`, encrypted volume)
 - [ ] Optional: run the executor steps as a Step Functions workflow for a visual run history
 - [x] Architecture diagrams and an honest comparison with Trusted Advisor and Cloud Custodian
-- [ ] GitHub Actions deploy via OIDC (no stored keys): built and tested locally, waiting for its first real run
+- [ ] GitHub Actions deploy via OIDC (no stored keys): built and tested locally, but blocked on the author's account by an organization policy, so it has never run
 - [ ] Reproducible evaluation on seeded waste scenarios (precision, recall, scan time)
 - [ ] Optional: AI-written explanations of findings (never makes decisions)
 
@@ -292,4 +295,5 @@ terraform/bootstrap/               One-time state bucket, plus the OIDC provider
 .github/workflows/ci.yml           Lint, test, terraform validate, Checkov, gitleaks
 .github/workflows/deploy.yml       Plan on every change, apply after approval (OIDC, no stored keys)
 .github/scripts/                   Log hygiene (quiet.sh) and plan summary (plan-summary.sh)
+.github/checkov/                   Variable file so CI also scans the optional OIDC roles
 ```

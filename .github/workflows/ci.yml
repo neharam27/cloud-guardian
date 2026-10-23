@@ -54,6 +54,15 @@ jobs:
           directory: terraform
           framework: terraform
           quiet: true
+      # The optional OIDC deploy roles are switched off by default (count = 0), and Checkov
+      # does not check resources that do not exist. Scan them once more with the switch on.
+      - name: Checkov with the optional OIDC deploy roles switched on
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform/bootstrap
+          framework: terraform
+          quiet: true
+          var_file: .github/checkov/bootstrap-oidc-on.tfvars.json
 
   secrets:
     name: Secret scan

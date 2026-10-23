@@ -4,6 +4,11 @@ name: Deploy
 # "production" environment, and only from main. No AWS keys are stored: the jobs get short-lived
 # credentials from AWS by proving their identity with GitHub's OIDC token.
 #
+# NEVER RUN: the organization that owns the author's AWS account forbids IAM OIDC providers
+# (a service control policy), so the AWS side of this could not be created. It is kept for
+# accounts where that is allowed, and needs terraform/bootstrap applied with
+# enable_github_oidc = true first.
+#
 # Everything is switched off until the repository variable DEPLOY_ENABLED is set to "true".
 # This repository is public, so the logs are public: scripts in .github/scripts keep Terraform's
 # raw output (account ids, ARNs, the email address, the approver URL) out of them.

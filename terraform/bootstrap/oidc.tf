@@ -9,11 +9,22 @@
 #   terraform plan     (expect only additions)
 #   terraform apply
 #
+# OFF BY DEFAULT (enable_github_oidc = false). Some organizations forbid IAM OIDC providers
+# with a service control policy, and then the very first resource below fails with
+# "explicit deny in a service control policy". That is exactly what happened on the author's
+# account, so the OIDC deploy is built and tested but has never run against real AWS.
+#
 # Two roles:
 #   plan   read-only. Used for pull requests and for the plan step on main.
 #   apply  can change only cloud-guardian-* resources in one region. Can be assumed ONLY by a
 #          job that runs in the GitHub Environment named in var.github_environment, which is
 #          where the human approval happens.
+
+variable "enable_github_oidc" {
+  description = "Create the GitHub OIDC provider and the two deploy roles. Leave false unless your organization allows IAM OIDC providers (a service control policy can forbid them)."
+  type        = bool
+  default     = false
+}
 
 variable "github_repo" {
   description = "The only GitHub repository allowed to deploy, as owner/name."
@@ -41,9 +52,12 @@ locals {
   app_name   = "cloud-guardian"
   account_id = data.aws_caller_identity.current.account_id
   oidc_host  = "token.actions.githubusercontent.com"
+  oidc_count = var.enable_github_oidc ? 1 : 0
 }
 
 resource "aws_iam_openid_connect_provider" "github" {
+  count = local.oidc_count
+
   url            = "https://${local.oidc_host}"
   client_id_list = ["sts.amazonaws.com"]
   # No thumbprint_list: AWS verifies GitHub's certificate with its own trusted CA library.
@@ -52,13 +66,15 @@ resource "aws_iam_openid_connect_provider" "github" {
 # --- Plan role: read-only ------------------------------------------------------------------
 
 data "aws_iam_policy_document" "plan_trust" {
+  count = local.oidc_count
+
   statement {
     sid     = "GitHubPlanJobs"
     actions = ["sts:AssumeRoleWithWebIdentity"]
 
     principals {
       type        = "Federated"
-      identifiers = [aws_iam_openid_connect_provider.github.arn]
+      identifiers = [aws_iam_openid_connect_provider.github[0].arn]
     }
 
     condition {
@@ -80,28 +96,34 @@ data "aws_iam_policy_document" "plan_trust" {
 }
 
 resource "aws_iam_role" "plan" {
+  count = local.oidc_count
+
   name                 = "github-deploy-${local.app_name}-plan"
   description          = "GitHub Actions: read-only terraform plan for ${var.github_repo}"
-  assume_role_policy   = data.aws_iam_policy_document.plan_trust.json
+  assume_role_policy   = data.aws_iam_policy_document.plan_trust[0].json
   max_session_duration = 3600
 }
 
 # AWS's own read-only policy: enough for terraform to refresh and compare, changes nothing.
 resource "aws_iam_role_policy_attachment" "plan_read_only" {
-  role       = aws_iam_role.plan.name
+  count = local.oidc_count
+
+  role       = aws_iam_role.plan[0].name
   policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
 }
 
 # --- Apply role: scoped writes, only after approval ----------------------------------------
 
 data "aws_iam_policy_document" "apply_trust" {
+  count = local.oidc_count
+
   statement {
     sid     = "GitHubApprovedDeployJobs"
     actions = ["sts:AssumeRoleWithWebIdentity"]
 
     principals {
       type        = "Federated"
-      identifiers = [aws_iam_openid_connect_provider.github.arn]
+      identifiers = [aws_iam_openid_connect_provider.github[0].arn]
     }
 
     condition {
@@ -120,19 +142,25 @@ data "aws_iam_policy_document" "apply_trust" {
 }
 
 resource "aws_iam_role" "apply" {
+  count = local.oidc_count
+
   name                 = "github-deploy-${local.app_name}-apply"
   description          = "GitHub Actions: terraform apply for ${var.github_repo}, only from the ${var.github_environment} environment"
-  assume_role_policy   = data.aws_iam_policy_document.apply_trust.json
+  assume_role_policy   = data.aws_iam_policy_document.apply_trust[0].json
   max_session_duration = 3600
 }
 
 # Reading is needed to refresh state before applying; the writes below are the scoped part.
 resource "aws_iam_role_policy_attachment" "apply_read_only" {
-  role       = aws_iam_role.apply.name
+  count = local.oidc_count
+
+  role       = aws_iam_role.apply[0].name
   policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
 }
 
 data "aws_iam_policy_document" "apply" {
+  count = local.oidc_count
+
   # checkov:skip=CKV_AWS_111:Write access is limited by resource name prefix, not by "*". A deploy role must be able to write the resources it deploys.
   # checkov:skip=CKV_AWS_107:Same as above. No credential-exposure actions are granted.
   # checkov:skip=CKV_AWS_109:IAM write actions exist so Terraform can manage this project's own roles. They are limited to roles named cloud-guardian-*, the deploy roles are explicitly denied, and policies cannot be attached from outside that prefix.
@@ -227,23 +255,25 @@ data "aws_iam_policy_document" "apply" {
     actions = ["iam:*"]
     resources = [
       "arn:aws:iam::${local.account_id}:role/github-deploy-*",
-      aws_iam_openid_connect_provider.github.arn,
+      aws_iam_openid_connect_provider.github[0].arn,
     ]
   }
 }
 
 resource "aws_iam_role_policy" "apply" {
+  count = local.oidc_count
+
   name   = "scoped-writes"
-  role   = aws_iam_role.apply.id
-  policy = data.aws_iam_policy_document.apply.json
+  role   = aws_iam_role.apply[0].id
+  policy = data.aws_iam_policy_document.apply[0].json
 }
 
 output "plan_role_arn" {
   description = "Store as the GitHub secret AWS_PLAN_ROLE_ARN"
-  value       = aws_iam_role.plan.arn
+  value       = one(aws_iam_role.plan[*].arn)
 }
 
 output "apply_role_arn" {
   description = "Store as the GitHub secret AWS_APPLY_ROLE_ARN"
-  value       = aws_iam_role.apply.arn
+  value       = one(aws_iam_role.apply[*].arn)
 }
