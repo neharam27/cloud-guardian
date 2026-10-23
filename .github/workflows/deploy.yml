@@ -70,7 +70,7 @@ jobs:
       TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
       TF_IN_AUTOMATION: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: aws-actions/configure-aws-credentials@v6
         with:
@@ -128,7 +128,7 @@ jobs:
       TF_IN_AUTOMATION: "true"
       ALLOW_DESTROY: ${{ inputs.allow_destroy }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: aws-actions/configure-aws-credentials@v6
         with:
