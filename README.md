@@ -2,19 +2,17 @@
 
 A serverless AWS cost-governance tool. Every day it scans an account for forgotten, wasteful resources, estimates what each one costs per month, and emails a ranked report.
 
-**Status: early build.** Four read-only scanners (unattached EBS volumes, unassociated Elastic IPs, old snapshots, long-stopped EC2 instances). Nothing is ever modified or deleted.
+**Status: working.** Four scanners (unattached EBS volumes, unassociated Elastic IPs, old snapshots, long-stopped EC2 instances). Scanning is read-only. The only thing that can change your account is an approval-gated clean-up of one unattached EBS volume, which stays in dry run (changes nothing) unless you set `cleanup_mode = "live"`. See Approval-gated clean-up below.
 
 ## How it works
 
-```
-EventBridge Scheduler (daily)
-        |
-        v
-Lambda: scanner --ec2:Describe* (read-only)--> EC2
-        |  \
-        |   +--> DynamoDB: findings history (open / resolved, first and last seen)
-        v
-SNS topic (encrypted) --> email: only what changed, plus a weekly digest
+```mermaid
+flowchart LR
+  sched["EventBridge Scheduler<br/>daily 08:30 IST"] --> scanner["Lambda: scanner<br/>read-only"]
+  scanner -->|"ec2:Describe* only"| ec2[("EC2 / EBS<br/>your account")]
+  scanner <-->|"new, open, resolved"| findings[("DynamoDB<br/>findings history")]
+  scanner --> sns["SNS topic<br/>encrypted"]
+  sns --> mail(["Email: only what changed,<br/>plus a weekly digest"])
 ```
 
 Unattached-volume findings in the email also carry a one-time clean-up link; see Approval-gated clean-up below.
@@ -57,12 +55,14 @@ If the history table itself fails, the scan falls back to emailing every finding
 
 Scanning is read-only. Acting is a separate, much stricter path, and the only action so far is deleting one unattached EBS volume, after backing it up.
 
-```
-scanner email --(one-time link)--> approver: public page, a button, NO EC2 permissions
-                                        |  press the button
-                                        v
-                    executor: re-checks, backs up, deletes. The only function with EC2 write
-                    permissions, and only when cleanup_mode = live. It emails the outcome.
+```mermaid
+flowchart TB
+  mail(["Email with a one-time link<br/>per unattached-volume finding"]) -->|"person opens the link:<br/>confirm page only"| approver["Lambda: approver<br/>public URL, no EC2 permissions"]
+  approver -->|"person presses the button:<br/>claim the approval once"| approvals[("DynamoDB: approvals<br/>token hash, 24h expiry, used once")]
+  approver -->|"async invoke,<br/>approval id only"| executor["Lambda: executor<br/>write permissions only in live mode"]
+  executor -->|"re-read the approval"| approvals
+  executor -->|"re-check, back up,<br/>verify the backup, then delete"| ec2[("EC2 / EBS")]
+  executor -->|"email the outcome"| sns["SNS topic"]
 ```
 
 1. The scanner adds a one-time link under each unattached-volume finding it lists.
@@ -87,8 +87,33 @@ Things to know:
 
 - Anyone who has the email can use its links for 24 hours. Do not forward it.
 - The approver URL is public by necessity (a browser has no AWS credentials). The unguessable token is the only credential. Guessing one is not realistic (256 random bits), and a wrong guess only costs one cheap database read.
-- Status: tried end to end on real AWS (Sydney) with one throwaway 1 GiB volume. In dry run, the confirmation page and the button changed nothing and did not use the link up. After switching to live, one approval took a backup snapshot (about 47 seconds, completed, tagged with the volume and approval ids), deleted the volume, and the next scan closed the finding as resolved. Then it was switched back to dry run, which removed the write permission again.
+- Status: tried end to end on real AWS (Sydney) with one throwaway 1 GiB volume. In dry run, the confirmation page and the button changed nothing and did not use the link up. After switching to live, one approval took a backup snapshot (about 47 seconds, completed, tagged with the volume and approval ids), deleted the volume, and the next scan closed the finding as resolved. The outcome email arrived, and opening the same link again was refused as already used. Then it was switched back to dry run, which removed the write permission again.
 - Not yet exercised on real AWS: the IAM Deny for volumes tagged `guardian:ignore` (the code-level `guardian:ignore` check is tested, the IAM layer behind it is not), a backup that fails or stalls, and volumes that are encrypted or larger than a toy size. The tests for those run against a fake AWS only.
+
+## Why not Trusted Advisor or Cloud Custodian?
+
+Short answer: often you should use them. Cloud Guardian is a small, safe-by-default project that shows how a system like this is designed. It does not try to out-feature either tool. The facts below come from the vendors' own documentation as of October 2026, so check the links, because plans and features change.
+
+**AWS Trusted Advisor.** Its cost optimization category includes checks such as EC2 instances stopped for 30 days, idle load balancers (Classic only), idle NAT gateways, idle RDS instances, and EBS volume recommendations. It surfaces recommendations for you to act on. For a small account the catch is the plan: AWS's check reference says the Basic and Developer plans get the service-limit checks plus six security and fault-tolerance checks (no cost checks are listed among them), and API and CLI access needs Business Support+, Enterprise Support or Unified Operations.
+
+**AWS Compute Optimizer.** Its idle recommendations cover 12 resource types, including EBS volumes (flagged as unattached over a 32-day lookback) and EC2 instances (for example peak CPU under 5% and under 5 MB a day of network traffic over 14 days), refreshed daily. Most of its rules look at real usage. Cloud Guardian only looks at state and age, so for detecting what is *idle*, Compute Optimizer is the better tool.
+
+**Cloud Custodian.** A CNCF Incubating project under the Apache-2.0 license: a rules engine where YAML policies name a resource type, filters, actions and a mode (for example event-driven or scheduled), across AWS, Azure and GCP. It can express checks like the ones in this repository and many more. For a real organisation it is usually the better starting point.
+
+What Cloud Guardian offers instead:
+
+- **Safe behaviour built in and tested, not assembled.** Change-only emails, one-time human-approved links that expire, a backup before every delete, an independent re-check at the moment of action, a run-once guard, an approver with no EC2 permissions, a separate executor, and an IAM deny on anything tagged `guardian:ignore`. With a general rules engine you would design most of those yourself.
+- **Small enough to audit.** About 2,000 lines of Python in `src/` and about 2,600 lines of tests, and each of the clean-up's code guards has a test that fails when the guard is removed (checked by breaking them on purpose).
+- **No special plan needed.** It runs on an account with no paid support plan and no other AWS services to opt in to.
+- **Honest limits.** Four checks, one action, one region per deployment, usage is not measured, and costs are approximate list prices.
+
+| If you want... | Use |
+|---|---|
+| AWS-maintained recommendations based on real usage | Compute Optimizer (and Trusted Advisor, if your plan includes it) |
+| Policy-as-code across many resource types, accounts or clouds | Cloud Custodian |
+| A small, auditable, quiet-by-default scanner with an approval-gated clean-up, or a worked example of building one | Cloud Guardian |
+
+Sources: [Trusted Advisor check reference](https://docs.aws.amazon.com/awssupport/latest/user/trusted-advisor-check-reference.html), [Trusted Advisor cost optimization checks](https://docs.aws.amazon.com/awssupport/latest/user/cost-optimization-checks.html), [Compute Optimizer idle recommendations](https://docs.aws.amazon.com/compute-optimizer/latest/ug/view-idle-recommendations.html), [Cloud Custodian on GitHub](https://github.com/cloud-custodian/cloud-custodian).
 
 ## Cost estimates: read this
 
@@ -105,6 +130,8 @@ Treat them as a ranking signal, not billing data.
 
 - `MIN_AGE_DAYS` filters on volume *creation* age, because `DescribeVolumes` does not report when a volume was detached. A precise "unattached for N days" needs CloudTrail.
 - `DescribeAddresses` reports no allocation time, so Elastic IPs have no age filter: a brand-new address you are about to attach is reported until it is associated. Tag it `guardian:ignore=true` if that matters.
+- Detection looks at state and age only, never at actual use (CPU, network, disk activity). AWS Compute Optimizer does look at usage; see the comparison above.
+- One region per deployment. Scan several regions by deploying once per region.
 - "Stopped for N days" comes from the timestamp inside the instance's `StateTransitionReason` text (`DescribeInstances` has no stop-time field). Some stops carry no timestamp, for example a shutdown from inside the operating system. For those the stop time is unknown: an instance launched less than `stopped_min_age_days` ago is skipped, and an older one is reported but marked "stop time unknown" instead of guessing. CloudTrail would give an exact answer and is a later improvement.
 - Snapshots are skipped when an AMI you own references them, or when they carry a `dlm:managed` or `aws:backup*` tag. Deleting one snapshot in a chain may free little space, because later snapshots can depend on its blocks.
 
@@ -187,6 +214,7 @@ All services used here (Lambda, SNS, EventBridge Scheduler, S3, DynamoDB on-dema
 - [x] Tried end to end on a real test volume (dry run first, then live)
 - [ ] Exercise the remaining live paths on real AWS (IAM Deny on `guardian:ignore`, encrypted volume)
 - [ ] Optional: run the executor steps as a Step Functions workflow for a visual run history
+- [x] Architecture diagrams and an honest comparison with Trusted Advisor and Cloud Custodian
 - [ ] GitHub Actions deploy via OIDC (no stored keys)
 - [ ] Reproducible evaluation on seeded waste scenarios (precision, recall, scan time)
 - [ ] Optional: AI-written explanations of findings (never makes decisions)
