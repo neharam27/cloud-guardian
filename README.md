@@ -186,6 +186,57 @@ aws ec2 allocate-address --domain vpc --region YOUR_REGION
 
 Delete both afterwards (`aws ec2 delete-volume ...`, `aws ec2 release-address --allocation-id ...`). To remove the whole stack: `terraform destroy` in `terraform/`.
 
+## Deploying from GitHub Actions (optional)
+
+You can keep running `terraform apply` by hand. This adds a pipeline that plans every change and applies it only after you approve, with **no AWS keys stored on GitHub**.
+
+Status: written, linted and tested piece by piece (the scripts, the plan summary, the destroy guard). It has not run against real GitHub and AWS yet; see the Roadmap.
+
+```mermaid
+flowchart LR
+  push["Push or pull request"] --> plan["Job: plan<br/>read-only AWS role"]
+  plan --> report["Run summary:<br/>names of changes only"]
+  plan -->|"push to main with changes"| gate{"Environment: production<br/>you approve"}
+  gate -->|"approved"| apply["Job: apply<br/>scoped AWS role<br/>refuses destroys"]
+  gate -.->|"not approved"| none["Nothing is deployed"]
+```
+
+**How it gets AWS access.** Each job asks GitHub for a short-lived signed token that says which repository and which environment it runs in. AWS checks that against a trust policy and, only if it matches, hands out temporary credentials. There is nothing to leak or rotate.
+
+- The **plan role** can only read. It trusts pull requests of this repository and runs on `main`.
+- The **apply role** trusts only jobs that run in the GitHub environment `production`, and that environment requires your approval. It can change only `cloud-guardian-*` resources in one region, cannot attach managed policies, and has an explicit deny on touching the deploy roles themselves.
+- Both roles live in `terraform/bootstrap`, which the pipeline never deploys, so **the pipeline cannot edit its own permissions**.
+
+**Safety rules in the pipeline.**
+
+- A plan that would **destroy** anything is refused unless you start the run by hand with `allow_destroy` ticked.
+- The apply job plans again right before applying, so what is applied is exactly what was checked.
+- The pipeline always deploys the safe defaults. It never sets `cleanup_mode = "live"`, so if you switched live mode on by hand, the next approved deploy puts it back to dry run.
+- Pull requests from forks get no secrets and no token, and the plan job skips them.
+
+**Logs are public on a public repository.** Terraform's normal output contains your account id, ARNs, your email address and the approver URL. So the scripts in `.github/scripts` never print it. Terraform's output goes to a file, the log shows only resource names and counts, a failed step prints a short excerpt with account ids, emails and URLs masked, the account id is masked explicitly (the AWS action does not do that by default), and the email is stored as a secret.
+
+**Residual risk, stated plainly.** The apply role can write IAM roles named `cloud-guardian-*`, because the stack manages them. In principle someone who could get a change approved could widen one of those roles and run code as it. What stops that is the approval step, the trust condition that ties the role to the `production` environment, and the explicit deny on the deploy roles. The next hardening step is a permissions boundary on the project's roles. The plan role is AWS's `ReadOnlyAccess`, which can read data in the account, not only configuration.
+
+**One-time setup.**
+
+1. Create the roles (the pipeline cannot create its own):
+
+   ```
+   cd terraform/bootstrap
+   terraform plan      # expect additions only, nothing about the state bucket
+   terraform apply
+   terraform output
+   ```
+
+   If the plan mentions the state bucket, stop: the `region` variable differs from the one you used the first time.
+
+2. GitHub, Settings, Environments: create `production`, add yourself under Required reviewers, and under Deployment branches choose Selected branches and add `main`.
+3. GitHub, Settings, Secrets and variables, Actions. Secrets: `AWS_PLAN_ROLE_ARN` and `AWS_APPLY_ROLE_ARN` (from `terraform output`), `TF_STATE_BUCKET` (the state bucket name) and `ALERT_EMAIL`. Variables: `AWS_REGION`. Last of all, the variable `DEPLOY_ENABLED` set to `true`. Until it is set, the workflow does nothing.
+4. Actions tab, Deploy, Run workflow on `main`. The plan job should end with "No changes". Run it once more with `force_apply` ticked, approve it, and the apply job proves the apply role works without changing anything.
+
+`.gitattributes` forces Unix line endings on every machine, and the Lambda zip uses a fixed file mode, so the package checksum is the same on Windows and on the runner. If your first plan still shows the three Lambda functions as changed, that is the cause: apply it once through the pipeline.
+
 ## Looking at the history
 
 ```bash
@@ -215,7 +266,7 @@ All services used here (Lambda, SNS, EventBridge Scheduler, S3, DynamoDB on-dema
 - [ ] Exercise the remaining live paths on real AWS (IAM Deny on `guardian:ignore`, encrypted volume)
 - [ ] Optional: run the executor steps as a Step Functions workflow for a visual run history
 - [x] Architecture diagrams and an honest comparison with Trusted Advisor and Cloud Custodian
-- [ ] GitHub Actions deploy via OIDC (no stored keys)
+- [ ] GitHub Actions deploy via OIDC (no stored keys): built and tested locally, waiting for its first real run
 - [ ] Reproducible evaluation on seeded waste scenarios (precision, recall, scan time)
 - [ ] Optional: AI-written explanations of findings (never makes decisions)
 
@@ -237,6 +288,8 @@ src/scanners/ec2_stopped.py        Long-stopped EC2 instances and the disks they
 src/scanners/pricing.py            Cost estimation (approximate)
 tests/                             pytest + moto (mocked AWS, no account needed)
 terraform/                         Main stack (cleanup.tf holds the clean-up pieces)
-terraform/bootstrap/               One-time state bucket
+terraform/bootstrap/               One-time state bucket, plus the OIDC provider and the two deploy roles (oidc.tf)
 .github/workflows/ci.yml           Lint, test, terraform validate, Checkov, gitleaks
+.github/workflows/deploy.yml       Plan on every change, apply after approval (OIDC, no stored keys)
+.github/scripts/                   Log hygiene (quiet.sh) and plan summary (plan-summary.sh)
 ```

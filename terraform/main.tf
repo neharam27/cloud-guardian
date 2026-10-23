@@ -9,6 +9,10 @@ data "archive_file" "lambda" {
   source_dir  = "${path.module}/../src"
   output_path = "${path.module}/build/lambda.zip"
   excludes    = ["**/__pycache__/**", "**/*.pyc"]
+
+  # Same file mode for every file in the zip on every operating system, so the package
+  # checksum is identical when built on Windows and on the CI runner.
+  output_file_mode = "0666"
 }
 
 # --- Notifications -------------------------------------------------------------

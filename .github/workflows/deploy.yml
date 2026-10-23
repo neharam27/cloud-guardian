@@ -1,0 +1,167 @@
+name: Deploy
+
+# Plans on every pull request and every push to main. Applies only after a human approves the
+# "production" environment, and only from main. No AWS keys are stored: the jobs get short-lived
+# credentials from AWS by proving their identity with GitHub's OIDC token.
+#
+# Everything is switched off until the repository variable DEPLOY_ENABLED is set to "true".
+# This repository is public, so the logs are public: scripts in .github/scripts keep Terraform's
+# raw output (account ids, ARNs, the email address, the approver URL) out of them.
+
+on:
+  pull_request:
+    paths:
+      - "terraform/**"
+      - "!terraform/bootstrap/**"
+      - "src/**"
+      - ".github/workflows/deploy.yml"
+      - ".github/scripts/**"
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - "!terraform/bootstrap/**"
+      - "src/**"
+      - ".github/workflows/deploy.yml"
+      - ".github/scripts/**"
+  workflow_dispatch:
+    inputs:
+      force_apply:
+        description: "Run the apply job even if the plan shows no changes (a smoke test of the deploy role)"
+        type: boolean
+        default: false
+      allow_destroy:
+        description: "Allow this run to destroy resources. Read the plan first."
+        type: boolean
+        default: false
+
+permissions: {}
+
+# One deploy at a time. Pull request plans have their own group so they can never cancel a
+# deploy that is waiting for approval.
+concurrency:
+  group: terraform-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.number) || 'deploy' }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan
+    # Pull requests from forks get no secrets and no OIDC token, so skip them.
+    if: >-
+      ${{ vars.DEPLOY_ENABLED == 'true' &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      changes: ${{ steps.summary.outputs.changes }}
+      destroys: ${{ steps.summary.outputs.destroys }}
+    env:
+      STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+      TF_VAR_region: ${{ vars.AWS_REGION }}
+      TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+      TF_IN_AUTOMATION: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.10"
+          terraform_wrapper: false
+
+      - name: Init
+        working-directory: terraform
+        run: |
+          mkdir -p build
+          bash ../.github/scripts/quiet.sh init.log \
+            terraform init -input=false \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="region=${TF_VAR_region}"
+
+      # -lock=false: this role is read-only, so it must not write a lock file.
+      - name: Plan
+        working-directory: terraform
+        run: |
+          bash ../.github/scripts/quiet.sh plan.log \
+            terraform plan -input=false -no-color -lock=false -out=tfplan
+
+      - name: Summarize (names only, no values)
+        id: summary
+        working-directory: terraform
+        run: |
+          terraform show -json tfplan > plan.json
+          bash ../.github/scripts/plan-summary.sh plan.json
+
+  apply:
+    name: Apply (waits for your approval)
+    needs: plan
+    if: >-
+      ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main' &&
+      (needs.plan.outputs.changes != '0' || inputs.force_apply) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The approval happens here: the environment requires a reviewer, and the AWS apply role
+    # only trusts tokens issued to jobs that run in this environment.
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+      TF_VAR_region: ${{ vars.AWS_REGION }}
+      TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+      TF_IN_AUTOMATION: "true"
+      ALLOW_DESTROY: ${{ inputs.allow_destroy }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.10"
+          terraform_wrapper: false
+
+      - name: Init
+        working-directory: terraform
+        run: |
+          mkdir -p build
+          bash ../.github/scripts/quiet.sh init.log \
+            terraform init -input=false \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="region=${TF_VAR_region}"
+
+      # Plan again right before applying, so what is applied is exactly what is checked here.
+      - name: Plan, then check for destroys
+        working-directory: terraform
+        run: |
+          bash ../.github/scripts/quiet.sh plan.log \
+            terraform plan -input=false -no-color -out=tfplan
+          terraform show -json tfplan > plan.json
+          bash ../.github/scripts/plan-summary.sh plan.json
+          destroys=$(jq '[.resource_changes[]? | select(.mode == "managed") | select(.change.actions | index("delete"))] | length' plan.json)
+          if [ "${destroys}" != "0" ] && [ "${ALLOW_DESTROY}" != "true" ]; then
+            echo "::error::This plan would destroy ${destroys} resource(s). Nothing was changed. If that is intended, run this workflow by hand from the Actions tab with allow_destroy ticked."
+            exit 1
+          fi
+
+      - name: Apply
+        working-directory: terraform
+        run: |
+          bash ../.github/scripts/quiet.sh apply.log \
+            terraform apply -input=false -no-color tfplan
+          grep -E "^Apply complete" apply.log || true
