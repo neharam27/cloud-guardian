@@ -1,5 +1,7 @@
 # Cloud Guardian
 
+[![CI](https://github.com/neharam27/cloud-guardian/actions/workflows/ci.yml/badge.svg)](https://github.com/neharam27/cloud-guardian/actions/workflows/ci.yml)
+
 A serverless AWS cost-governance tool. Every day it scans an account for forgotten, wasteful resources, estimates what each one costs per month, and emails a ranked report.
 
 **Status: working.** Four scanners (unattached EBS volumes, unassociated Elastic IPs, old snapshots, long-stopped EC2 instances). Scanning is read-only. The only thing that can change your account is an approval-gated clean-up of one unattached EBS volume, which stays in dry run (changes nothing) unless you set `cleanup_mode = "live"`. See Approval-gated clean-up below.
@@ -69,6 +71,12 @@ flowchart TB
 2. **Opening the link only shows a confirmation page.** Email security tools pre-fetch links to scan them, so a link that acted on open could delete your volume. Only the button (a POST, with the token in the body, never the URL) acts.
 3. Pressing it uses the approval up (once only) and starts the executor. The executor trusts nothing in that message but an id: it re-reads the approval from the database.
 4. It checks the volume again at that moment, takes a backup snapshot, checks the backup, checks the volume once more, and only then deletes.
+
+**What it looks like.** These two screenshots are from the real test in Sydney (22 October 2026), in dry run, with the same test volume. The report email lists the unattached volume with a one-time link (hidden here). The link opens a confirm page, and pressing its button in dry run shows this result and changes nothing:
+
+![Report email listing one unattached volume with a one-time clean-up link (link hidden)](docs/screenshots/report-email.png)
+
+![Dry run result page: would snapshot the volume, then delete it; nothing was changed](docs/screenshots/dry-run-result.png)
 
 **One switch, two layers.** `cleanup_mode` in `terraform.tfvars` defaults to `dry_run`. In dry run the button only shows what would happen (and does not use the approval up), and the executor's IAM role has no permission to snapshot or delete, so even a bug in the code could not change anything. `live` turns on both. Only the exact word `false` in the executor's `DRY_RUN` setting enables real actions, and nothing in a message can override it.
 
@@ -290,6 +298,7 @@ src/scanners/snapshots_old.py      Old, unused snapshots
 src/scanners/ec2_stopped.py        Long-stopped EC2 instances and the disks they still bill for
 src/scanners/pricing.py            Cost estimation (approximate)
 tests/                             pytest + moto (mocked AWS, no account needed)
+docs/screenshots/                  Screenshots used above (link, account id and email hidden)
 terraform/                         Main stack (cleanup.tf holds the clean-up pieces)
 terraform/bootstrap/               One-time state bucket, plus the OIDC provider and the two deploy roles (oidc.tf)
 .github/workflows/ci.yml           Lint, test, terraform validate, Checkov, gitleaks
